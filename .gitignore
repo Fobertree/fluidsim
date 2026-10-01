@@ -1,0 +1,10 @@
+.idea/
+
+shader_old.slang
+
+shaders/render
+shaders/compute
+
+include/vkappbase.h
+include/collision.h
+include/debug.h
