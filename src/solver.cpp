@@ -38,11 +38,12 @@ const std::vector<float>& Eulerian2D<T>::get_data() {
     auto currentTime = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < lenI; i++) {
         for (int j = 0; j < lenJ; j++) {
+            // TODO: thread pool, openmp, or execution policy this
             T u_component = mutils::avg<T>(mac.u(i,j), mac.u(i+1,j));
             T v_component = mutils::avg<T>(mac.v(i,j), mac.v(i,j+1));
             render_data[(i * lenJ) + j] = std::sqrt(u_component*u_component + v_component*v_component);
             double time = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - startTime).count(); // NOLINT
-            render_data[(i * lenJ) + j] = std::sin(i*j + time); // NOLINT
+            render_data[(i * lenJ) + j] = std::sin(i + time * 0.05 * j / lenJ); // NOLINT
         }
     }
     // TODO normalize

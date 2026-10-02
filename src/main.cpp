@@ -43,7 +43,7 @@ import vulkan_hpp;
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
-constexpr uint32_t NUM_CELLS = 1000;
+constexpr uint32_t NUM_CELLS = 100;
 
 constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 
@@ -98,7 +98,9 @@ class FluidSimApplication {
 //    using SOLVER_T = std::conditional_t<S == SOLVER_TYPE::Eulerian2D, Eulerian2D<T>, SolverBase>;
     using SOLVER_T = Eulerian2D<double>;
 public:
-    explicit FluidSimApplication(int i = NUM_CELLS, int j = NUM_CELLS) : fluidSolver(SOLVER_T(i, j)) {};
+    explicit FluidSimApplication(int i = NUM_CELLS, int j = NUM_CELLS) : fluidSolver(SOLVER_T(i, j)), texWidth(j), texHeight(i) {
+        std::cerr << std::format("i: {}, j: {}\n", i,j);
+    };
 
     void run() {
         initWindow();
@@ -634,7 +636,6 @@ private:
 
     void createTextureImages() {
         // TODO: 2D/3D flexibility
-        int texWidth{256}, texHeight{256};
         // TODO: populate initial solver data texture here
         // velocity, from solver
         std::vector<float> field_quantity(texHeight * texWidth);
@@ -648,8 +649,7 @@ private:
             auto [textureBuffer, textureBufferMemory] = createBuffer(imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
             void* data = textureBufferMemory.mapMemory(0, imageSize);
             memcpy(data, field_quantity.data(), imageSize);
-            // not sure if it's better to map/unmap each update (probably?), keeping singular map for now since not mem constrained
-            // textureBufferMemory.unmapMemory();
+            // keep memory mapped for updates
 
             auto [textureImage, textureImageMem] = createImage(
                     texWidth,
@@ -671,69 +671,37 @@ private:
             textureImageBuffersMapped.emplace_back(data);
 
             textureImages.emplace_back(std::move(textureImage));
+            textureImagesMemory.emplace_back(std::move(textureImageMem));
         }
     }
 
     // run after every iteration to pull texture data, particularly scalar field
     void updateSolverImageTextures(uint32_t currentImage) {
-#if 0
-        // TODO: texWidth, texHeight to private member
-        int texWidth{256}, texHeight{256};
+        // fetch data
+        auto& commandBuffer = commandBuffers[currentImage];
+        auto& textureImage = textureImages[currentImage];
+        auto& textureImageBuffer = textureImageBuffers[currentImage];
+        // TODO: command buffer begin single commands?
 
-        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-            // fetch data
-            auto& commandBuffer = commandBuffers[currentImage];
-            auto& textureImage = textureImages[currentImage];
-            auto& textureImageBuffer = textureImageBuffers[currentImage];
-            // TODO: command buffer begin single commands?
+        vk::CommandBufferBeginInfo beginInfo {.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit};
+        commandBuffer.begin(beginInfo);
 
-            vk::CommandBufferBeginInfo beginInfo {.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit};
-            commandBuffer.begin(beginInfo);
+        transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eShaderReadOnlyOptimal,
+                              vk::ImageLayout::eTransferDstOptimal);
+        std::vector<float> field_quantity = fluidSolver.get_data();
 
-            transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eShaderReadOnlyOptimal,
-                                  vk::ImageLayout::eTransferDstOptimal);
-            std::vector<float> field_quantity = fluidSolver.get_data();
-            std::cerr << "Attempt Copy Buffer To Image\n";
-            copyBufferToImage(commandBuffer, textureImageBuffer, textureImage, static_cast<uint32_t>(texWidth),
-                              static_cast<uint32_t>(texHeight));
-            std::cerr << "End attempt to copy buffer to image\n";
-            transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eTransferDstOptimal,
-                                  vk::ImageLayout::eShaderReadOnlyOptimal);
+        // find downsampling/interpolation scheme if memory constraints get bad
+        memcpy(textureImageBuffersMapped[currentImage], field_quantity.data(), field_quantity.size() * sizeof(float));
+        copyBufferToImage(commandBuffer, textureImageBuffer, textureImage, static_cast<uint32_t>(texWidth),
+                          static_cast<uint32_t>(texHeight));
+        transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eTransferDstOptimal,
+                              vk::ImageLayout::eShaderReadOnlyOptimal);
 
-            commandBuffer.end();
-        }
-#else
-
-        // TODO: texWidth, texHeight to private member
-        int texWidth{256}, texHeight{256};
-
-        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-            // fetch data
-            auto& commandBuffer = commandBuffers[currentImage];
-            auto& textureImage = textureImages[currentImage];
-            auto& imageMemory = textureImageBuffersMemory[currentImage];
-
-            textureImage.bindMemory(imageMemory, 0);
-
-            auto& textureImageBuffer = textureImageBuffers[currentImage];
-            // TODO: command buffer begin single commands?
-
-            vk::CommandBufferBeginInfo beginInfo {.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit};
-            commandBuffer.begin(beginInfo);
-
-            transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eShaderReadOnlyOptimal,
-                                  vk::ImageLayout::eTransferDstOptimal);
-            std::vector<float> field_quantity = fluidSolver.get_data();
-            std::cerr << "Attempt Copy Buffer To Image\n";
-            copyBufferToImage(commandBuffer, textureImageBuffer, textureImage, static_cast<uint32_t>(texWidth),
-                              static_cast<uint32_t>(texHeight));
-            std::cerr << "End attempt to copy buffer to image\n";
-            transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eTransferDstOptimal,
-                                  vk::ImageLayout::eShaderReadOnlyOptimal);
-
-            commandBuffer.end();
-        }
-#endif
+        // TODO: consolidate into endSingleCommandsCall
+        commandBuffer.end();
+        vk::SubmitInfo submitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandBuffer};
+        queue.submit(submitInfo, nullptr);
+        queue.waitIdle();
     }
 
     // image view and sampler
@@ -754,13 +722,14 @@ private:
             .mipmapMode = vk::SamplerMipmapMode::eLinear,
             // TODO: do not use repeat, since we are using a scalar field. Maybe clamp to border?
             // shouldn't matter since we shouldn't sample outside texture
-            .addressModeU = vk::SamplerAddressMode::eRepeat,
-            .addressModeV = vk::SamplerAddressMode::eRepeat,
-            .addressModeW = vk::SamplerAddressMode::eRepeat,
+            .addressModeU = vk::SamplerAddressMode::eClampToBorder,
+            .addressModeV = vk::SamplerAddressMode::eClampToBorder,
+            .addressModeW = vk::SamplerAddressMode::eClampToBorder,
             .anisotropyEnable = vk::True,
             .maxAnisotropy = properties.limits.maxSamplerAnisotropy,
             .compareEnable = vk::False,
-            .compareOp = vk::CompareOp::eAlways
+            .compareOp = vk::CompareOp::eAlways,
+            .borderColor = vk::BorderColor::eFloatOpaqueWhite,
         };
 
         // no border color, since scalar field. I assume it doesn't work together
@@ -1181,26 +1150,6 @@ private:
         memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
     }
 
-#if 0
-    void updateImageUniformData() {
-        // update sampler2D tex2d image uniform data
-        // TODO: impl - currently using updateUniformBuffer temporarily
-        auto [lenI, lenJ] = fluidSolver.get_dims();
-        static vk::DeviceSize imageSize = lenI * lenJ * sizeof(T);
-
-        auto [stagingBuffer, stagingBufferMemory] = createBuffer(
-                imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible |
-                vk::MemoryPropertyFlagBits::eHostCoherent
-                );
-
-        // build image of raw scalar magnitudes
-        // data will be normalized/color-mapped to [0,255] rgba in shader
-        auto display_data = fluidSolver.get_data();
-
-        void* data = stagingBufferMemory.mapMemory(0, imageSize);
-        memcpy(data, display_data.data(), imageSize);
-    }
-#endif
     void createDescriptorPool() {
         // descriptor sets must be allocated from pool, like command buffers
         vk::DescriptorPoolSize uniformPoolSize {
@@ -1343,6 +1292,9 @@ private:
     std::vector<vk::raii::Image> textureImages;
     std::vector<vk::raii::ImageView> textureImageViews;
     vk::raii::Sampler textureSampler = nullptr;
+    // Not sure if we want to downsample later for memory constraints
+    int texWidth;
+    int texHeight;
 
     vk::raii::DescriptorPool descriptorPool = nullptr;
     std::vector<vk::raii::DescriptorSet> descriptorSets;
@@ -1351,6 +1303,7 @@ private:
     std::vector<vk::raii::Buffer> textureImageBuffers;
     std::vector<vk::raii::DeviceMemory> textureImageBuffersMemory;
     std::vector<void*> textureImageBuffersMapped;
+    std::vector<vk::raii::DeviceMemory> textureImagesMemory;
 };
 
 int main() {
