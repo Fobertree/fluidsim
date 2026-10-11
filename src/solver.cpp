@@ -1,17 +1,23 @@
 #include <iostream>
 #include <chrono>
+#include <thread>
 
 #include "solver.h"
+
+template<std::floating_point T>
+void Eulerian2D<T>::load_environment() {
+    // Will add once there's more complex set of IC to invoke in MAC
+}
 
 template<std::floating_point T>
 void Eulerian2D<T>::update_labels() {
     // classify as solid, air, fluid
     // not sure if pressure + velocity need to be reset, but not doing so for now
-    for (int i = 0; i < lenI; i++) {
-        for (int j = 0; j < lenJ; j++) {
+    for (int i = 1; i <= lenI; i++) {
+        for (int j = 1; j <= lenJ; j++) {
             if (vec_utils::isApproximatelyZero(pressure_unknowns(i,j))) {
                 // 0 pressure -> air (Dirichlet for pressure system)
-                labels[i][j] = Label::EMPTY;
+                mac.label(i,j) = Label::EMPTY;
             }
         }
     }
@@ -21,7 +27,7 @@ void Eulerian2D<T>::update_labels() {
 template<std::floating_point T>
 void Eulerian2D<T>::iterate() {
     // enforce BC both before and after updates
-    update_labels();
+    //update_labels();
     advect();
     enforceBC();
     apply_body_forces();
@@ -36,17 +42,32 @@ template<std::floating_point T>
 const std::vector<float>& Eulerian2D<T>::get_data() {
     static auto startTime = std::chrono::high_resolution_clock::now();
     auto currentTime = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < lenI; i++) {
-        for (int j = 0; j < lenJ; j++) {
+    float minF = 99999;
+    float maxF = 0;
+    int cnt = 0;
+    std::cerr << "DOB\b";
+    for (int i = 1; i <= lenI; i++) {
+        for (int j = 1; j <= lenJ; j++) {
             // TODO: thread pool, openmp, or execution policy this
             T u_component = mutils::avg<T>(mac.u(i,j), mac.u(i+1,j));
             T v_component = mutils::avg<T>(mac.v(i,j), mac.v(i,j+1));
-            render_data[(i * lenJ) + j] = std::sqrt(u_component*u_component + v_component*v_component);
-            double time = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - startTime).count(); // NOLINT
-            render_data[(i * lenJ) + j] = std::sin(i + time * 0.05 * j / lenJ); // NOLINT
+            size_t idx = ((i-1) * lenJ) + j-1;
+            // TODO: make sloppy indexing more aesthetic
+            render_data[idx] = std::sqrt(u_component*u_component + v_component*v_component);
+            //double time = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - startTime).count(); // NOLINT
+            //render_data[(i * lenJ) + j] = std::sin(i + time * 0.05 * j / lenJ); // NOLINT
+            if (std::isnan(render_data[idx])) {
+                throw std::runtime_error("NAN DETECTED");
+            }
+            minF = std::min(minF, render_data[(i*lenJ)+j]);
+            maxF = std::max(maxF, render_data[(i*lenJ)+j]);
+            cnt++;
         }
     }
-    // TODO normalize
+
+    std::cout << std::format("min: {}, max: {}, cnt: {}\n", minF, maxF, cnt);
+
+    std::cerr << "BOB";
 
     return render_data;
 }
@@ -70,15 +91,15 @@ void Eulerian2D<T>::advect() {
     // need ending pos, q^n (velocity from mac)
     // run numerical integration to get previous position
     // TODO: numerical integrators should return position x_P
-    for (int i = 0; i < lenI; i++) {
-        for (int j = 0; j < lenJ; j++) {
+    for (int i = 1; i <= lenI; i++) {
+        for (int j = 1; j <= lenJ; j++) {
             // run numerical integration once per dimension
             // counterintuitive vs interpolating into vector field and interpolating back
             // but each dimensional scalar field is independent of the others
             auto mac_u_pos = mac.get_u_mac_pos(i,j);
             auto mac_v_pos = mac.get_v_mac_pos(i,j);
-            T u_u = eulerian_utils::RK3_u(mac_u_pos, mac.u(i,j), mac, 1, labels);
-            T u_v = eulerian_utils::RK3_v(mac_v_pos, mac.v(i,j), mac, 1, labels);
+            T u_u = eulerian_utils::RK3_u(mac_u_pos, mac.u_prev(i,j), mac, dt, labels);
+            T u_v = eulerian_utils::RK3_v(mac_v_pos, mac.v_prev(i,j), mac, dt, labels);
             mac.u(i,j) = u_u;
             mac.v(i,j) = u_v;
         }
@@ -92,7 +113,7 @@ void Eulerian2D<T>::apply_body_forces() {
     // u^B = u^A + dt * g
     constexpr static T GRAVITY = -10;
 
-    Eigen::Tensor<T,2> v = (mac.v + GRAVITY).eval();
+    Eigen::Tensor<T,2> v = (mac.v + GRAVITY * dt).eval();
     mac.v = v;
 }
 
@@ -105,7 +126,9 @@ void Eulerian2D<T>::apply_body_forces() {
 template<std::floating_point T>
 void Eulerian2D<T>::project() {
     get_negative_divergence();
+    std::cerr << "Negative Divergence complete\n";
     get_A_grid();
+    std::cerr << "A grid complete\n";
     get_preconditioner();
     apply_pcg_to_pressure_system();
     // TODO: swap buffers here
@@ -122,41 +145,42 @@ void Eulerian2D<T>::project() {
 template<std::floating_point T>
 void Eulerian2D<T>::get_negative_divergence() {
     double scale = dt / (rho * dx);
+    divergence.setZero();
     // 5.3 on u^{n}
     scale = 1./dx;
-    for (int i = 0; i < lenI; i++) {
-        for (int j = 0; j < lenJ; j++) {
-            if (label(i,j) == Label::FLUID) {
-                divergence(i,j) -= scale * (
+    for (int i = 1; i <= lenI; i++) {
+        for (int j = 1; j <= lenJ; j++) {
+            if (label(i, j) == Label::FLUID) {
+                divergence(i, j) -= scale * (
                         mac.u(i + 1, j) - mac.u(i, j) +
                         mac.v(i, j + 1) - mac.v(i, j)
                 );
 
                 // 5.4 solids
                 // u axis
-                if (i > 0 && label(i-1,j) == Label::SOLID) {
-                    divergence(i,j) -= scale * (
-                            mac.u(i,j) - mac.u_solid(i,j)
-                            );
+                if (label(i - 1, j) == Label::SOLID) {
+                    divergence(i, j) -= scale * (
+                            mac.u(i, j) - mac.u_solid(i, j)
+                    );
                 }
 
-                if (i+1 < lenI && label(i+1,j) == Label::SOLID) {
-                    divergence(i,j) += scale * (
-                            mac.u(i+1,j) - mac.u_solid(i+1,j)
-                            );
+                if (label(i + 1, j) == Label::SOLID) {
+                    divergence(i, j) += scale * (
+                            mac.u(i + 1, j) - mac.u_solid(i + 1, j)
+                    );
                 }
 
                 // v axis
-                if (j > 0 && label(i,j-1) == Label::SOLID) {
-                    divergence(i,j) -= scale * (
-                            mac.v(i,j) - mac.v_solid(i,j)
-                            );
+                if (label(i, j - 1) == Label::SOLID) {
+                    divergence(i, j) -= scale * (
+                            mac.v(i, j) - mac.v_solid(i, j)
+                    );
                 }
 
-                if (j+1 < lenJ && label(i,j+1) == Label::SOLID) {
-                    divergence(i,j) += scale * (
-                            mac.v(i,j+1) - mac.v_solid(i,j+1)
-                            );
+                if (label(i, j + 1) == Label::SOLID) {
+                    divergence(i, j) += scale * (
+                            mac.v(i, j + 1) - mac.v_solid(i, j + 1)
+                    );
                 }
             }
         }
@@ -166,48 +190,41 @@ void Eulerian2D<T>::get_negative_divergence() {
 template<> void Eulerian2D<>::get_A_grid() {
     // 5.5
     double scale = dt / (rho*dx*dx);
-    // declare static?
+    a_grid.reset();
+
     auto& Adiag = a_grid.Adiag;
     auto& Ax = a_grid.Ax;
     auto& Ay = a_grid.Ay;
 
-    static auto idx = [](int i, int j) {return i*j;};
+    static auto idx = [&](int i, int j) {return i*lenJ + j;};
 
-    for (int i = 0; i < lenI; i++) {
-        for (int j = 0; j < lenJ; j++) {
-            // reset
-            Adiag(i,j) = 0;
-            Ax(i,j) = 0;
-            Ax(i,j) = 0;
-
+    for (int i = 1; i <= lenI; i++) {
+        for (int j = 1; j <= lenJ; j++) {
+            // CHECK LABEL NOT OOB
             // negative x neighbor
-            if (i > 0 && label(i-1,j) == Label::FLUID) {
+            if (label(i-1,j) == Label::FLUID) {
                 Adiag(i,j) += scale;
             }
             // positive x neighbor
-            if (i+1 < lenI) {
-                if (label(i+1,j) == Label::FLUID) {
-                    Adiag(i,j) += scale;
-                    Ax(i,j) -= scale;
-                }
-                else if (label(i+1,j) == Label::EMPTY) {
-                    Adiag(i,j) += scale;
-                }
+            if (label(i+1,j) == Label::FLUID) {
+                Adiag(i,j) += scale;
+                Ax(i,j) -= scale;
+            }
+            else if (label(i+1,j) == Label::EMPTY) {
+                Adiag(i,j) += scale;
             }
 
             // negative y neighbor
-            if (j > 0 && label(i,j-1) == Label::FLUID) {
+            if (label(i,j-1) == Label::FLUID) {
                 Adiag(i,j) += scale;
             }
             // positive y neighbor
-            if (j+1 < lenJ) {
-                if (label(i,j+1) == Label::FLUID) {
-                    Adiag(i,j) += scale;
-                    Ay(i,j) -= scale;
-                }
-                else if (label(i,j+1) == Label::EMPTY) {
-                    Adiag(i,j) += scale;
-                }
+            if (label(i,j+1) == Label::FLUID) {
+                Adiag(i,j) += scale;
+                Ay(i,j) -= scale;
+            }
+            else if (label(i,j+1) == Label::EMPTY) {
+                Adiag(i,j) += scale;
             }
         }
     }
@@ -215,21 +232,40 @@ template<> void Eulerian2D<>::get_A_grid() {
 
 template<std::floating_point T>
 Eigen::Tensor<T,2> Eulerian2D<T>::apply_A(const Eigen::Tensor<T,2>& pressure_search) {
-    // up to 5 values per row. Each (i,j) adds 3 values per column
+    // up to 5 values per row (5-point stencil, discrete Poisson). Each (i,j) adds 3 values per column
+    // Ap_search=z
     Eigen::Tensor<T,2> out(lenI, lenJ);
     auto& Adiag = a_grid.Adiag;
     auto& Ax = a_grid.Ax;
     auto& Ay = a_grid.Ay;
 
-    for (int i = 0; i < lenI; i++) {
-        for (int j = 0; j < lenJ; j++) {
-            out(i,j) = Ax(i,j) * pressure_search(i+1,j) + Ay(i,j) * pressure_search(i,j+1) + Adiag(i,j) * pressure_search(i,j);
+    size_t A_size = lenI * lenJ;
+
+    // TODO: possibly bad calc
+    for (int i = 1; i <= lenI; i++) {
+        for (int j = 1; j <= lenJ; j++) {
+            // TODO: offset by 1 on all ghost cell
+            // Should have up to 5 values: Aplusx, Aminusx, Adiag, Aplusj, Aminusj
+            // Adiag(i,j) * p(i,j)
+            out(i,j) = Adiag(i,j) * pressure_search(i,j);
+            // Ax(i,j-1) * p(i,j-1)
+            out(i,j) += Ax(i,j-1) * pressure_search(i,j-1);
+
+            // Ay(i-1,j) * p(i-1,j)
+            out(i,j) += Ay(i-1,j) * pressure_search(i-1,j);
+
+            // Ax(i,j+1) * p(i,j+1)
+            out(i,j) += Ax(i,j) * pressure_search(i,j+1);
+
+            // Ay(i,j) * p(i+1,j)
+            out(i, j) += Ay(i, j) * pressure_search(i + 1, j);
         }
     }
     return out;
 }
 
 // maybe shouldn't be void, to semantically guarantee this executes
+// https://docs.nvidia.com/cuda/incomplete-lu-cholesky/index.html
 template<std::floating_point T>
 void Eulerian2D<T>::get_preconditioner() {
     // 5.7
@@ -242,8 +278,9 @@ void Eulerian2D<T>::get_preconditioner() {
     T e;
     auto pow2 = [](auto x) {return x*x;};
 
-    // i <= lenI, j <= lenJ -> OOB, cerr outputs "vector", if I default labels sz to (i,j) (idk why)
+    precon.setZero();
 
+    // TODO: check if bounds are correct. Is i,j <= or < lenI/lenJ?
     for (int i = 1; i <= lenI; i++) {
         for (int j = 1; j <= lenJ; j++) {
             if (label(i,j) == Label::FLUID) {
@@ -264,7 +301,7 @@ void Eulerian2D<T>::get_preconditioner() {
                 if (e < sigma * Adiag(i,j)) {
                     e = Adiag(i,j);
                 }
-                precon(i,j) = 1. / sqrt(e);
+                precon(i,j) = 1. / (sqrt(e) + 1e-9);
             }
         }
     }
@@ -317,7 +354,7 @@ Eigen::Tensor<T,2> Eulerian2D<T>::apply_preconditioner(const Eigen::Tensor<T, 2>
 template<std::floating_point T>
 void Eulerian2D<T>::apply_pcg_to_pressure_system() {
     // 5.6
-    constexpr static int MAX_ITER = 1000;
+    constexpr static int MAX_ITER = 10;
     constexpr static double TOL = 1e-6;
     pressure_unknowns.setZero();
     auto residual = divergence;
@@ -335,12 +372,12 @@ void Eulerian2D<T>::apply_pcg_to_pressure_system() {
     T sigma = vec_utils::dot(z, residual);
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
-        // TODO: A * s
+        // As = z
         z = apply_A(s);
         T alpha = sigma/vec_utils::dot(z,s);
         Eigen::Tensor<T,2> tmp = (pressure_unknowns + alpha * s).eval();
         pressure_unknowns = tmp;
-        residual = residual - alpha * z;
+        residual -= alpha * z;
         // maximum returns zero dimension tensor
         // https://stackoverflow.com/a/74115830
         Eigen::Tensor<double,0> mx = residual.maximum();
@@ -351,7 +388,7 @@ void Eulerian2D<T>::apply_pcg_to_pressure_system() {
         z = apply_preconditioner(residual);
         T sigma_new = vec_utils::dot(z,residual);
         T beta = sigma_new / sigma;
-        s = z + beta * s;
+        s = (z + beta * s).eval();
         sigma = sigma_new;
     }
     std::cerr << "Apply PCG to Pressure System::ITERATION LIMIT EXCEEDED\n";
@@ -360,10 +397,9 @@ void Eulerian2D<T>::apply_pcg_to_pressure_system() {
 
 template<std::floating_point T>
 void Eulerian2D<T>::update_pressure() {
-    Eigen::Map<const Eigen::MatrixXd> tensorMap(pressure_unknowns.data(), lenI, lenJ);
-    // TODO: correct dims
-//    std::cout << "mac.p shape" << vec_utils::get_shape(mac.p) << ", pressure unknowns: " << vec_utils::get_shape(tensorMap) << "\n";
-    mac.p += tensorMap;
+    // reshape
+    Eigen::Map<const Eigen::MatrixXd> tensorMap(pressure_unknowns.data(), ghostLenI, ghostLenI);
+    mac.p = tensorMap;
 }
 
 template<std::floating_point T>
@@ -375,8 +411,8 @@ void Eulerian2D<T>::update_velocities() {
 
     // do we need to separately handle i=0, j=0 row/col? Probably need to extrapolate on very boundaries
     // update - 5.2
-    for (int i = 0; i < lenI; i++) {
-        for (int j = 0; j < lenJ; j++) {
+    for (int i = 1; i <= lenI; i++) {
+        for (int j = 1; j <= lenJ; j++) {
             // u update
             if (label(i,j) == Label::FLUID || label(i+1, j) == Label::FLUID) {
                 if (label(i,j) == Label::SOLID || label(i+1,j) == Label::SOLID) {
@@ -385,7 +421,7 @@ void Eulerian2D<T>::update_velocities() {
                     mac.u(i+1, j) -= scale * (mac.p(i+1,j) - mac.p(i,j));
                 }
             } else {
-                labels[i+1][j] = Label::UNKNOWN;
+                label(i+1,j) = Label::UNKNOWN;
             }
             // v update
             if (label(i,j) == Label::FLUID || label(i,j+1) == Label::FLUID) {
@@ -395,7 +431,7 @@ void Eulerian2D<T>::update_velocities() {
                     mac.v(i,j+1) = scale * (mac.p(i,j+1) - mac.p(i,j));
                 }
             } else {
-                labels[i][j+1] = Label::UNKNOWN;
+                label(i,j+1) = Label::UNKNOWN;
             }
         }
     }
@@ -405,13 +441,13 @@ template<std::floating_point T>
 void Eulerian2D<T>::enforceBC() {
     // homogeneous Dirichlet BC
     // u dim
-    for (int j = 0; j < lenJ; j++) {
+    for (int j = 0; j <= ghostLenJ; j++) {
         mac.u(0,j) = 0;
         mac.u(lenI, j) = 0;
     }
 
     // v dim
-    for (int i = 0; i < lenI; i++) {
+    for (int i = 0; i < ghostLenI; i++) {
         mac.v(i,0) = 0;
         mac.v(i, lenJ) = 0;
     }

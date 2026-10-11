@@ -106,4 +106,13 @@ add_custom_command(
 add_custom_target(${SHADER_TARGET} DEPENDS ${SHADERS_DIR}/slang.spv)
 add_dependencies(${PROJECT_NAME} ${SHADER_TARGET})
 
+target_compile_options(${PROJECT_NAME} PRIVATE
+    -fsanitize=undefined,float-divide-by-zero
+    -fno-sanitize-recover=all
+)
+
+target_link_options(${PROJECT_NAME} PRIVATE
+    -fsanitize=undefined,float-divide-by-zero
+)
+
 # TODO: Assets DIR

@@ -29,9 +29,9 @@ namespace mac_utils::interpolate {
             // unsure if need to address edge case of being exactly on grid line
             auto [x,y] = pos;
             int x1 = std::floor(x);
-            int x2 = std::ceil(x);
-            int y1 = std::ceil(y);
-            int y2 = std::floor(y);
+            int x2 = x1+1;
+            int y1 = std::floor(y);
+            int y2 = y+1;
             // fetch grid corner points
             auto [u_top_left, u_bottom_left, u_top_right, u_bottom_right] = mac.get_cell_velocities(static_cast<int>(pos[0]), static_cast<int>(pos[1]));
             // can prob do smth better than this

@@ -39,7 +39,7 @@ public:
         // vert axis
         u = TVEC_T(i+1,j);
         // horiz axis
-        v = TVEC_T(i+1,j);
+        v = TVEC_T(i,j+1);
 
         u_prev = TVEC_T(i+1,j);
         v_prev = TVEC_T(i,j+1);
@@ -48,6 +48,42 @@ public:
 
         u_solid = TVEC_T(i+1,j);
         v_solid = TVEC_T(i,j+1);
+
+        // tmp until we have solids, or relabel with solids later
+        labels = std::vector<Label>(i*j, Label::FLUID);
+
+        u.setZero();
+        v.setZero();
+        u_prev.setZero();
+        v_prev.setZero();
+        // don't need solid for now
+        // naive - will be optimized against mesh via hash rather than copying val across every cell
+        u_solid.setZero();
+        v_solid.setZero();
+        p.setZero();
+
+        // setup sim IC
+        init_mac_values();
+        std::cout << std::format("lenI: {}, lenJ: {}\n", lenI, lenJ);
+    }
+
+    inline size_t idx(int i, int j) const {return i*lenJ + j;}
+
+    void init_mac_values() {
+        // impose IC u(0,x)
+        u.setConstant(1.0);
+        u_prev.setConstant(1.0);
+
+        // label grid boundaries as solid
+        for (int i = 0; i < lenI; i++) {
+            labels[idx(i,0)] = Label::SOLID;
+            labels[idx(i,lenJ-1)] = Label::SOLID;
+        }
+
+        for (int j = 0; j < lenJ; j++) {
+            labels[idx(0,j)] = Label::SOLID;
+            labels[idx(lenI-1,j)] = Label::SOLID;
+        }
     }
 
     // DEPRECATE
@@ -62,19 +98,19 @@ public:
         };
     }
 
-    std::array<T, 4> get_u_velocities(const std::array<T,2>& pos) const {
+    [[nodiscard]] std::array<T, 4> get_u_velocities(const std::array<T,2>& pos) const {
         int fi{static_cast<int>(pos[0])};
         int fj{static_cast<int>(pos[1])};
         return {
-            u(fi, fj),
-            u(fi+1,fj),
-            u(fi,fj+1),
-            u(fi+1,fj+1)
+            u(fi, fj),  // top left
+            u(fi+1,fj), // bottom left
+            u(fi,fj+1), // top right
+            u(fi+1,fj+1)    // bottom right
         };
     }
 
 
-    std::array<T, 4> get_v_velocities(const std::array<T,2>& pos) const {
+    [[nodiscard]] std::array<T, 4> get_v_velocities(const std::array<T,2>& pos) const {
         int fi{static_cast<int>(pos[0])};
         int fj{static_cast<int>(pos[1])};
         return {
@@ -85,21 +121,53 @@ public:
         };
     }
 
+    [[nodiscard]] std::array<T, 4> get_prev_u_velocities(const std::array<T,2>& pos) const {
+        int fi{static_cast<int>(pos[0])};
+        int fj{static_cast<int>(pos[1])};
+        return {
+                u_prev(fi, fj),  // top left
+                u_prev(fi+1,fj), // bottom left
+                u_prev(fi,fj+1), // top right
+                u_prev(fi+1,fj+1)    // bottom right
+        };
+    }
+
+
+    [[nodiscard]] std::array<T, 4> get_prev_v_velocities(const std::array<T,2>& pos) const {
+        int fi{static_cast<int>(pos[0])};
+        int fj{static_cast<int>(pos[1])};
+        return {
+                v_prev(fi, fj),
+                v_prev(fi+1,fj),
+                v_prev(fi,fj+1),
+                v_prev(fi+1,fj+1)
+        };
+    }
+
     // Note: below is multiplied by dx=1
     // get mac position for u cell
     [[nodiscard]] std::array<T,2> get_u_mac_pos(int i,int j) {
-        return {static_cast<T>(i), 0.5+j};
+        return clamp_pos({static_cast<T>(i), 0.5+j});
     }
 
     // gety mac position for v cell
     [[nodiscard]] std::array<T,2> get_v_mac_pos(int i, int j) {
-        return {i+0.5,static_cast<T>(j)};
+        return clamp_pos({i + 0.5, static_cast<T>(j)});
     }
 
     void swap_buffers() {
         std::swap(u, u_prev);
         std::swap(v,v_prev);
     }
+
+    Label& label(int i, int j) {
+        assert((1 <= lenI && j <= lenJ && i >= 0 && j >= 0) && "OUT OF BOUNDS");
+
+        return labels.at(i*lenJ + j);
+    }
+
+    const int getLenI() const {return lenI-1;}
+    const int getLenJ() const {return lenJ-1;}
 
     using TVEC_T = Eigen::Tensor<T,2>;
 
@@ -124,13 +192,16 @@ public:
 private:
     int lenI, lenJ;
 
+    std::vector<Label> labels;
+
     // For advection - store old quantities in case advection yields OOB
     // 37 - averages mac neighbors into grid cell corners
     // this returns u(i,j) at the center of the cell, based on its mac quantities
     // call when original point from numerical integrator in advection x_G is in a solid
-    Eigen::Vector2<T> u_ij_naive (int i, int j) {
-        Eigen::Vector2<T> out;
-        out(0) = (u(i+1,j) - u(i,j)) * 0.5;
+    std::array<T,2> clamp_pos(const std::array<T,2>& pos) {
+        std::array<T,2> out;
+        out[0] = std::clamp(pos[0], 0., lenI-2.);
+        out[1] = std::clamp(pos[1], 0., lenJ-2.);
         return out;
     }
 
@@ -143,6 +214,7 @@ private:
         uint8_t nei_cnt_u{0};
         uint8_t nei_cnt_v{0};
         // left
+        // TODO: ghost cells to get rid of awkward conditionals
         if (j > 0) {
             out(0) += u(i,j-1);
             nei_cnt_u++;

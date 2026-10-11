@@ -38,6 +38,9 @@ import vulkan_hpp;
 #include <stdexcept>
 #include <cstdlib>
 #include <fstream>
+// Enable FP exceptions
+#pragma STDC FENV_ACCESS ON
+#include <cfenv>
 
 #include "solver.h"
 
@@ -689,6 +692,7 @@ private:
         transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eShaderReadOnlyOptimal,
                               vk::ImageLayout::eTransferDstOptimal);
         std::vector<float> field_quantity = fluidSolver.get_data();
+        std::cerr << "DOBBY\n";
 
         // find downsampling/interpolation scheme if memory constraints get bad
         memcpy(textureImageBuffersMapped[currentImage], field_quantity.data(), field_quantity.size() * sizeof(float));

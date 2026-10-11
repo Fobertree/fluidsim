@@ -31,9 +31,11 @@ namespace mutils {
 
 namespace vec_utils {
     template<typename T, int DIM>
-    bool isApproximatelyZero(Eigen::Tensor<T, DIM>& tensor, double eps=1e-9) {
-        auto data = tensor.data();
-        return !std::any_of(data, data + tensor.size(), [&eps](auto x) {return std::abs(x) <= eps;});
+    bool isApproximatelyZero(const Eigen::Tensor<T, DIM>& tensor, double eps=1e-9) {
+        // inf norm
+        Eigen::TensorFixedSize<T, Eigen::Sizes<>> max_tensor = tensor.abs().maximum();
+        float mx = max_tensor();
+        return mx <= eps;
     }
 
     template<std::floating_point T>
